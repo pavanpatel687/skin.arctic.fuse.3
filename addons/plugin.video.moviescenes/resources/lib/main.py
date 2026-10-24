@@ -172,17 +172,35 @@ def _float(value, default=0.0):
 
 def play(params):
     ref = resolve(params)
-    path, title, fanart, dbid = ref['path'], display_title(ref), ref['fanart'], ref['dbid']
     start = _float(params.get('t'))
     end = _float(params.get('e'), None)
     if end is not None and end <= start:
         end = None
-    if not path:
+    if not ref['path']:
         notify('Movie not found in the library', error=True)
         return
     # Remember where the movie was left off, so stopping at a scene's end doesn't move it.
-    resume = (movie_details(dbid, ['resume']) or {}).get('resume') if (dbid and end) else None
+    resume = get_resume(ref) if end else None
+    player = start_scene(ref, start)
+    if not player or end is None:
+        return
+    if watch_until(player, start, end):
+        stop_scene(player, ref, resume)
+        if params.get('ret') == 'demo':
+            open_demo()
+        else:
+            show_info(ref)
+    elif not player.isPlaying():
+        restore_resume(ref, resume)  # stopped partway through the scene
 
+
+def get_resume(ref):
+    return (movie_details(ref['dbid'], ['resume']) or {}).get('resume') if ref.get('dbid') else None
+
+
+def start_scene(ref, start):
+    """Start the movie at `start`. Returns the player once it's running, or None."""
+    path, title, fanart, dbid = ref['path'], display_title(ref), ref['fanart'], ref['dbid']
     xbmc.executebuiltin('Dialog.Close(all,true)')
     li = xbmcgui.ListItem(path=path, offscreen=True)
     li.setProperty('StartOffset', '%.3f' % start)
@@ -205,7 +223,7 @@ def play(params):
         except RuntimeError:
             return False
     if not wait_for(started, 20000):
-        return
+        return None
     if start > 0:
         xbmc.sleep(500)
         try:
@@ -213,8 +231,7 @@ def play(params):
                 player.seekTime(start)
         except RuntimeError:
             pass
-    if end is not None and watch_until(player, start, end):
-        finish_scene(player, ref, resume)
+    return player
 
 
 def watch_until(player, start, end):
@@ -241,15 +258,18 @@ def watch_until(player, start, end):
     return False
 
 
-def finish_scene(player, ref, resume):
+def stop_scene(player, ref, resume):
     player.stop()
     wait_for(lambda: not player.isPlaying(), 5000)
+    restore_resume(ref, resume)
+
+
+def restore_resume(ref, resume):
     dbid = ref.get('dbid')
     if dbid and resume is not None:
         xbmc.sleep(1500)  # let Kodi (and PlexKodiConnect) finish saving the stop first
         rpc('VideoLibrary.SetMovieDetails', movieid=dbid,
             resume={'position': resume.get('position', 0), 'total': resume.get('total', 0)})
-    show_info(ref)
 
 
 INFO_PROPS = ['title', 'year', 'plot', 'tagline', 'art', 'file', 'uniqueid', 'imdbnumber', 'genre',
@@ -440,6 +460,8 @@ def manage(params):
                    ('end', 'Change end time' if scene.get('end') else 'Set end time')]
         if scene.get('end'):
             options.append(('noend', 'Remove end time (keep playing)'))
+        in_demo = store.demo_index(store.load_demo(), ref, scene['start']) >= 0
+        options.append(('undemo', 'Remove from demo scenes') if in_demo else ('demo', 'Add to demo scenes'))
         options.append(('delete', 'Delete'))
         picked = dlg.contextmenu([label for _, label in options])
         action = options[picked][0] if picked >= 0 else None
@@ -448,6 +470,7 @@ def manage(params):
             if name:
                 scene['title'] = name.strip()
                 changed = bool(store.save(ref, data, folder)) or changed
+                store.demo_sync(ref, scene['start'], scene, folder)
         elif action == 'start':
             text = dlg.input('Start time (h:mm:ss)', defaultt=store.fmt_time(scene['start']))
             start = store.parse_time(text) if text else None
@@ -456,21 +479,36 @@ def manage(params):
                     notify('The start has to be before the end (%s)' % store.fmt_time(scene['end']), error=True)
                     continue
                 store.delete_thumb(folder, scene)  # thumbnail no longer matches
+                old_start = scene['start']
                 scene['start'], scene['thumb'] = start, ''
                 changed = bool(store.save(ref, data, folder)) or changed
+                store.demo_sync(ref, old_start, scene, folder)
         elif action == 'end':
             end = _ask_end(dlg, scene)
             if end:
                 scene['end'] = end
                 changed = bool(store.save(ref, data, folder)) or changed
+                store.demo_sync(ref, scene['start'], scene, folder)
         elif action == 'noend':
             scene.pop('end', None)
             changed = bool(store.save(ref, data, folder)) or changed
+            store.demo_sync(ref, scene['start'], scene, folder)
+        elif action == 'demo':
+            entries = store.load_demo()
+            entries.append(store.demo_entry(ref, scene, folder))
+            if store.save_demo(entries):
+                notify('Added "%s" to demo scenes' % scene['title'])
+            else:
+                notify("Couldn't save the demo list", error=True)
+        elif action == 'undemo':
+            store.demo_sync(ref, scene['start'], None)
+            notify('Removed "%s" from demo scenes' % scene['title'])
         elif action == 'delete':
             if dlg.yesno(HEADING, 'Delete "%s"?' % scene['title']):
                 store.delete_thumb(folder, scene)
                 data['scenes'].remove(scene)
                 changed = bool(store.save(ref, data, folder)) or changed
+                store.demo_sync(ref, scene['start'], None)
     if changed:
         # Reload the info screen's Scenes row.
         xbmc.executebuiltin('Container.Refresh')
@@ -494,6 +532,7 @@ def _keep_some(dlg, ref, data, folder, fanart):
         return False
     for s in remove:
         store.delete_thumb(folder, s)
+        store.demo_sync(ref, s['start'], None)
     data['scenes'] = [s for i, s in enumerate(scenes) if i in keep]
     if store.save(ref, data, folder):
         notify('Deleted %d scene%s' % (len(remove), '' if len(remove) == 1 else 's'))
@@ -539,6 +578,135 @@ def pick(params):
     play(ref_params(ref, **scene_params(data['scenes'][choice])))
 
 
+# ---------- demo scenes ----------
+
+DEMO_URL = 'plugin://%s/?action=demo' % store.ADDON_ID
+REEL_DEFAULT_LENGTH = 120  # seconds, for demo scenes without an end time
+
+
+def open_demo():
+    xbmc.sleep(300)
+    xbmc.executebuiltin('ActivateWindow(Videos,"%s",return)' % DEMO_URL)
+
+
+def library_index():
+    """Map tmdb-/imdb- keys to this device's library movies."""
+    res = rpc('VideoLibrary.GetMovies', properties=['title', 'year', 'uniqueid', 'imdbnumber', 'art', 'file'])
+    index = {}
+    for m in res.get('movies') or []:
+        for key in store.id_keys(ref_from_details(m)):
+            index.setdefault(key, m)
+    return index
+
+
+def demo_refs():
+    """[(entry, ref)] for demo scenes whose movie is in this device's library."""
+    index = library_index()
+    out = []
+    for e in store.load_demo():
+        m = next((index[k] for k in store.id_keys(e['movie']) if k in index), None)
+        if m:
+            out.append((e, ref_from_details(m)))
+    return out
+
+
+def _entry_range(e):
+    return store.fmt_range({'start': float(e['start']), 'end': e.get('end')})
+
+
+def list_demo(handle):
+    xbmcplugin.setContent(handle, 'videos')
+    pairs = demo_refs()
+    items = []
+    if pairs:
+        art = pairs[0][0].get('thumb') or pairs[0][1]['fanart']
+        li = xbmcgui.ListItem('Play all (%d scene%s)' % (len(pairs), '' if len(pairs) == 1 else 's'), offscreen=True)
+        li.setArt({'thumb': art, 'landscape': art, 'fanart': art})
+        li.setProperty('override_landscape', art)
+        li.getVideoInfoTag().setPlot('Plays every demo scene back to back, then comes back here.')
+        items.append((url(action='reel'), li, False))
+    for e, ref in pairs:
+        thumb = e.get('thumb') if e.get('thumb') and xbmcvfs.exists(e['thumb']) else ref['fanart']
+        movie = display_title(ref)
+        li = xbmcgui.ListItem(e.get('title') or 'Scene', '%s · %s' % (movie, _entry_range(e)), offscreen=True)
+        li.setArt({'thumb': thumb, 'landscape': thumb, 'fanart': ref['fanart'] or thumb, 'icon': thumb})
+        li.setProperty('override_landscape', thumb)
+        tag = li.getVideoInfoTag()
+        tag.setTitle(e.get('title') or 'Scene')
+        tag.setMediaType('video')
+        tag.setPlot('%s · %s' % (movie, _entry_range(e)))
+        params = {'action': 'play', 'dbid': ref['dbid'], 't': '%.3f' % float(e['start']), 'ret': 'demo'}
+        if e.get('end'):
+            params['e'] = '%.3f' % float(e['end'])
+        items.append((url(**params), li, False))
+    li = xbmcgui.ListItem('Edit demo list' if pairs else 'No demo scenes yet', offscreen=True)
+    li.getVideoInfoTag().setPlot('Reorder or remove demo scenes. Add them from a movie\'s Edit scenes.'
+                                 if pairs else 'In a movie, open Scenes > Edit scenes, pick a scene and choose Add to demo scenes.')
+    items.append((url(action='demoedit'), li, False))
+    xbmcplugin.addDirectoryItems(handle, items, len(items))
+    xbmcplugin.endOfDirectory(handle, succeeded=True, cacheToDisc=False)
+
+
+def reel():
+    pairs = demo_refs()
+    if not pairs:
+        notify('No demo scenes yet')
+        return
+    for n, (e, ref) in enumerate(pairs, 1):
+        start = float(e['start'])
+        end = float(e['end']) if e.get('end') else start + REEL_DEFAULT_LENGTH
+        resume = get_resume(ref)
+        notify('%d of %d: %s' % (n, len(pairs), e.get('title') or display_title(ref)))
+        player = start_scene(ref, start)
+        if not player:
+            continue
+        if not watch_until(player, start, end):
+            if not player.isPlaying():
+                restore_resume(ref, resume)  # stopped: end the reel
+            return                           # or skipped ahead: leave the movie playing
+        stop_scene(player, ref, resume)
+    open_demo()
+
+
+def edit_demo():
+    dlg = xbmcgui.Dialog()
+    changed = False
+    while True:
+        entries = store.load_demo()
+        if not entries:
+            notify("No demo scenes yet. Add them from a movie's Edit scenes")
+            break
+        labels = []
+        for e in entries:
+            movie = e['movie'].get('title', '')
+            li = xbmcgui.ListItem(e.get('title') or 'Scene', '%s · %s' % (movie, _entry_range(e)))
+            if e.get('thumb'):
+                li.setArt({'thumb': e['thumb'], 'icon': e['thumb']})
+            labels.append(li)
+        i = dlg.select('Demo scenes', labels, useDetails=True)
+        if i < 0:
+            break
+        action = dlg.contextmenu(['Move up', 'Move down', 'Remove from demo scenes'])
+        if action == 0 and i > 0:
+            entries[i - 1], entries[i] = entries[i], entries[i - 1]
+        elif action == 1 and i < len(entries) - 1:
+            entries[i + 1], entries[i] = entries[i], entries[i + 1]
+        elif action == 2:
+            entries.pop(i)
+        else:
+            continue
+        changed = store.save_demo(entries) or changed
+    if changed:
+        xbmc.executebuiltin('Container.Refresh')
+
+
+def list_root(handle):
+    li = xbmcgui.ListItem('Demo scenes', offscreen=True)
+    li.getVideoInfoTag().setPlot('Your favourite scenes from across your movies.')
+    xbmcplugin.addDirectoryItems(handle, [(DEMO_URL, li, True)], 1)
+    xbmcplugin.endOfDirectory(handle, succeeded=True)
+
+
 # ---------- entry point ----------
 
 def run(argv):
@@ -549,8 +717,16 @@ def run(argv):
     handle = int(argv[1]) if len(argv) > 1 and argv[1].lstrip('-').isdigit() else -1
     params = dict(parse_qsl(argv[2].lstrip('?'))) if len(argv) > 2 else {}
     action = params.get('action', 'list')
-    if action == 'list' and handle >= 0:
+    if action == 'list' and handle >= 0 and not (params.get('dbid') or params.get('file')):
+        list_root(handle)
+    elif action == 'list' and handle >= 0:
         list_scenes(handle, params)
+    elif action == 'demo' and handle >= 0:
+        list_demo(handle)
+    elif action == 'reel':
+        reel()
+    elif action == 'demoedit':
+        edit_demo()
     elif action == 'play':
         play(params)
     elif action == 'pick':

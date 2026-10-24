@@ -249,3 +249,83 @@ def parse_time(text):
     for p in parts:
         total = total * 60 + p
     return total
+
+
+# ---------- demo scenes: a hand-picked list across movies ----------
+#
+# <scenes folder>/demo.json:
+#   {"version": 1, "scenes": [{"movie": {"title": "Heat", "year": 1995, "tmdb": "949", "imdb": "tt0113277"},
+#                              "title": "Downtown shootout", "start": 4620.0, "end": 4890.0,
+#                              "thumb": "smb://192.168.0.206/kodi/moviescenes/tmdb-949/0004620000.png"}]}
+#
+# Each entry is a copy of the scene, matched back to its movie by TMDb/IMDb ID and to the
+# scene by its start time, so it works on every device sharing the scenes folder.
+
+DEMO_NAME = 'demo.json'
+
+
+def _demo_path():
+    return shared_root() + DEMO_NAME
+
+
+def load_demo():
+    path = _demo_path()
+    if not xbmcvfs.exists(path):
+        return []
+    f = xbmcvfs.File(path)
+    try:
+        raw = f.read()
+    finally:
+        f.close()
+    try:
+        entries = json.loads(raw or '{}').get('scenes') or []
+    except ValueError:
+        log('Could not parse %s' % path, xbmc.LOGWARNING)
+        return []
+    return [e for e in entries if isinstance(e, dict) and isinstance(e.get('movie'), dict) and 'start' in e]
+
+
+def save_demo(entries):
+    root = shared_root()
+    if not xbmcvfs.exists(root) and not xbmcvfs.mkdirs(root):
+        return False
+    f = xbmcvfs.File(_demo_path(), 'w')
+    try:
+        ok = f.write(json.dumps({'version': 1, 'scenes': entries}, indent=2, ensure_ascii=False))
+    finally:
+        f.close()
+    return bool(ok)
+
+
+def _movie_keys(movie):
+    return set(id_keys(movie))
+
+
+def demo_index(entries, ref, start):
+    keys = _movie_keys(ref)
+    for i, e in enumerate(entries):
+        if keys & _movie_keys(e['movie']) and abs(float(e['start']) - start) < 0.5:
+            return i
+    return -1
+
+
+def demo_entry(ref, scene, folder):
+    entry = {'movie': {k: ref.get(k) or '' for k in ('title', 'year', 'tmdb', 'imdb')},
+             'title': scene.get('title', ''), 'start': scene['start'],
+             'thumb': thumb_path(folder, scene)}
+    if scene.get('end'):
+        entry['end'] = scene['end']
+    return entry
+
+
+def demo_sync(ref, old_start, scene=None, folder=None):
+    """Keep a demo entry in step with its scene: update it, or remove it when scene is None."""
+    entries = load_demo()
+    i = demo_index(entries, ref, old_start)
+    if i < 0:
+        return
+    if scene is None:
+        entries.pop(i)
+    else:
+        entries[i] = demo_entry(ref, scene, folder)
+    save_demo(entries)

@@ -21,6 +21,13 @@ Your own scene list for each movie, chosen from the info screen **before** the m
   lets you rename, retime or delete scenes, add one by typing a time, or use **Keep only some
   scenes…** to tick the ones to keep and delete the rest in one go.
 
+- **Demo scenes:** a page of favourite scenes from across your movies, for showing them off.
+  In a movie's **Edit scenes…**, pick a scene and choose **Add to demo scenes**. The page
+  (Video add-ons → Movie Scenes → **Demo scenes**) has **Play all**, which plays them back to back
+  and returns to the page, plus **Edit demo list** to reorder or remove. The list lives in
+  `demo.json` in the shared scenes folder, so every device sees the same one. Add the page to the
+  home menu with **Customise shortcuts and widgets**.
+
 It's made of these parts in this repo:
 
 | Part | What it does |
@@ -123,7 +130,7 @@ don't look washed out.
 
 Install both zips in Kodi (Settings → Add-ons → Install from zip file), on each device:
 
-1. **Movie Scenes add-on:** `dist/plugin.video.moviescenes-1.4.0.zip` from this branch.
+1. **Movie Scenes add-on:** `dist/plugin.video.moviescenes-1.5.0.zip` from this branch.
 2. **Skin:** on GitHub, switch to the `scene-selection` branch → **Code → Download ZIP**. Rename the
    folder inside the zip to `skin.arctic.fuse.3`, re-zip it, and install that.
 3. Add-ons → My add-ons → Look and feel → Skin → Arctic Fuse 3 → turn **Auto-update off**, so the
